@@ -69,6 +69,13 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 VideoGenerationRequest,
                                                 VideoJob, VideoJobList,
                                                 to_llm_disaggregated_params)
+from tensorrt_llm.serve.anthropic_protocol import (
+    AnthropicError, AnthropicErrorResponse, AnthropicUsage,
+    ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent,
+    MessageDeltaDetails, MessageDeltaEvent, MessageDeltaUsage,
+    MessageStartEvent, MessageStartPayload, MessageStopEvent, MessagesRequest,
+    MessagesResponse, PingEvent, TextBlock, TextDelta, ToolUseBlock,
+    map_finish_reason, sse_event)
 from tensorrt_llm.serve.postprocess_handlers import (
     ChatCompletionPostprocArgs, ChatPostprocArgs, CompletionPostprocArgs,
     ResponsesAPIPostprocArgs, chat_harmony_post_processor,
@@ -620,6 +627,10 @@ class OpenAIServer:
         self.app.add_api_route("/server_info",
                                self.get_server_info,
                                methods=["GET"])
+        # Anthropic Messages API — compatible with Claude Code and the Anthropic SDK
+        self.app.add_api_route("/v1/messages",
+                               self.anthropic_messages,
+                               methods=["POST"])
         if self.generator.args.return_perf_metrics:
             # register /prometheus/metrics
             self.mount_metrics()
@@ -1182,6 +1193,151 @@ class OpenAIServer:
         except Exception as e:
             logger.error(traceback.format_exc())
             return self.create_error_response(str(e))
+
+    async def anthropic_messages(self, request: MessagesRequest,
+                                 raw_request: Request) -> Response:
+        """Handle POST /v1/messages — Anthropic Messages API.
+
+        Translates the Anthropic request format into the internal generation
+        pipeline and returns either a full JSON response or an SSE stream,
+        matching the Anthropic API contract consumed by Claude Code and the
+        Anthropic SDK.
+        """
+
+        def _anthropic_error(message: str, err_type: str = "invalid_request_error",
+                             status: HTTPStatus = HTTPStatus.BAD_REQUEST) -> Response:
+            body = AnthropicErrorResponse(
+                error=AnthropicError(type=err_type, message=message))
+            return JSONResponse(content=body.model_dump(), status_code=status.value)
+
+        async def _stream_generator(promise: RequestOutput,
+                                    msg_id: str) -> AsyncGenerator[str, None]:
+            """Yield Anthropic SSE events for a streaming generation."""
+            output_tokens = 0
+            stop_reason: Optional[str] = None
+            stop_sequence: Optional[str] = None
+
+            # message_start — sent before any content
+            start_event = MessageStartEvent(
+                message=MessageStartPayload(
+                    id=msg_id,
+                    model=request.model,
+                    usage=AnthropicUsage(
+                        input_tokens=len(promise.prompt_token_ids)),
+                ))
+            yield sse_event("message_start", start_event)
+
+            # Open the first (text) content block
+            yield sse_event(
+                "content_block_start",
+                ContentBlockStartEvent(index=0,
+                                       content_block=TextBlock(text="")))
+            yield sse_event("ping", PingEvent())
+
+            try:
+                async for res in promise:
+                    for output in res.outputs:
+                        delta = output.text_diff
+                        if delta:
+                            yield sse_event(
+                                "content_block_delta",
+                                ContentBlockDeltaEvent(
+                                    index=0,
+                                    delta=TextDelta(text=delta)))
+                        if output.finish_reason is not None:
+                            stop_reason, stop_sequence = map_finish_reason(
+                                output.finish_reason, output.stop_reason)
+                        # output.length is the running total of generated tokens;
+                        # update after each chunk so the final value is accurate.
+                        output_tokens = getattr(output, "length",
+                                                output_tokens)
+            except Exception:
+                logger.error(traceback.format_exc())
+
+            yield sse_event("content_block_stop",
+                            ContentBlockStopEvent(index=0))
+            yield sse_event(
+                "message_delta",
+                MessageDeltaEvent(
+                    delta=MessageDeltaDetails(
+                        stop_reason=stop_reason or "end_turn",
+                        stop_sequence=stop_sequence),
+                    usage=MessageDeltaUsage(output_tokens=output_tokens)))
+            yield sse_event("message_stop", MessageStopEvent())
+
+        try:
+            conversation = request.to_conversation()
+            tool_dicts = request.to_openai_tools()
+            sampling_params = request.to_sampling_params()
+
+            if self.model_config is not None:
+                prompt: str = apply_chat_template(
+                    model_type=self.model_config.model_type,
+                    tokenizer=self.tokenizer,
+                    processor=self.processor,
+                    conversation=conversation,
+                    add_generation_prompt=True,
+                    mm_placeholder_counts=[],
+                    tools=tool_dicts,
+                    chat_template=self.chat_template,
+                    chat_template_kwargs={},
+                )
+            else:
+                # Fallback: plain concatenation when no model config is available
+                prompt = "\n".join(
+                    f"{m['role']}: {m['content']}" for m in conversation)
+                prompt += "\nassistant:"
+
+            inputs = prompt_inputs(prompt)
+
+            trace_headers = tracing.extract_trace_headers(raw_request.headers)
+            msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+
+            promise = self.generator.generate_async(
+                inputs=inputs,
+                sampling_params=sampling_params,
+                streaming=bool(request.stream),
+                trace_headers=trace_headers,
+            )
+            asyncio.create_task(self.await_disconnected(raw_request, promise))
+
+            if request.stream:
+                return StreamingResponse(
+                    content=_stream_generator(promise, msg_id),
+                    media_type="text/event-stream")
+
+            # Non-streaming: collect full output
+            await promise.aresult()
+            output = promise.outputs[0]
+            text = output.text
+            stop_reason, stop_sequence = map_finish_reason(
+                output.finish_reason, output.stop_reason)
+
+            num_prompt_tokens = len(promise.prompt_token_ids)
+            num_output_tokens = output.length if hasattr(output,
+                                                         "length") else len(
+                                                             output.token_ids)
+
+            response = MessagesResponse(
+                id=msg_id,
+                model=request.model,
+                content=[TextBlock(text=text)],
+                stop_reason=stop_reason or "end_turn",
+                stop_sequence=stop_sequence,
+                usage=AnthropicUsage(
+                    input_tokens=num_prompt_tokens,
+                    output_tokens=num_output_tokens,
+                ),
+            )
+            return JSONResponse(content=response.model_dump(exclude_none=True))
+
+        except CppExecutorError:
+            logger.error(traceback.format_exc())
+            signal.raise_signal(signal.SIGINT)
+        except Exception as e:
+            logger.error(traceback.format_exc())
+            return _anthropic_error(str(e), "server_error",
+                                    HTTPStatus.INTERNAL_SERVER_ERROR)
 
     async def openai_mm_encoder(self, request: ChatCompletionRequest,
                                 raw_request: Request) -> Response:
